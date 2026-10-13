@@ -38,6 +38,20 @@ CREATE TABLE IF NOT EXISTS tenant_provisioning_jobs (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE TABLE IF NOT EXISTS authentication_events (
+  id BIGSERIAL PRIMARY KEY,
+  organization_pk BIGINT REFERENCES organizations(id) ON DELETE SET NULL,
+  organization_id VARCHAR(40),
+  actor_id BIGINT,
+  email VARCHAR(254),
+  outcome VARCHAR(20) NOT NULL CHECK (outcome IN ('SUCCESS','FAILURE')),
+  description TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_authentication_events_org_created
+  ON authentication_events (organization_pk, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_authentication_events_orgid_created
+  ON authentication_events (UPPER(organization_id), created_at DESC);
 `;
 
 try {

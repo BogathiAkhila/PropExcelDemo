@@ -5,7 +5,9 @@ const pools = new Map<string, pg.Pool>();
 
 export function getTenantPool(databaseName: string): pg.Pool {
   // databaseName must come from the master DB, never directly from user input.
-  if (!/^[a-z][a-z0-9_]{2,62}$/.test(databaseName)) throw new Error('Invalid tenant database reference.');
+  if (!/^(?:[a-z][a-z0-9_]{0,62}|[A-Z0-9]{3,40})$/.test(databaseName)) {
+    throw new Error('Invalid tenant database reference.');
+  }
   let pool = pools.get(databaseName);
   if (!pool) {
     pool = new pg.Pool({

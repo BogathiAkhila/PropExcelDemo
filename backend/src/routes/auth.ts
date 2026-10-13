@@ -7,7 +7,8 @@ import { env } from '../config/env.js';
 import { authenticate } from '../middleware/auth.js';
 import { createTenantDatabase } from '../tenancy/neonProvisioner.js';
 import { initializeTenantDatabase, getTenantPool } from '../tenancy/tenantDb.js';
-import { audit } from '../services/audit.js';
+import { databaseNameFromOrganizationName } from '../tenancy/databaseName.js';
+import { audit, auditAuthenticationEvent } from '../services/audit.js';
 
 export const authRouter = Router();
 
@@ -36,15 +37,16 @@ authRouter.post('/signup', async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: 'Validation failed.', details: parsed.error.flatten() });
   const v = parsed.data;
   const organizationId = v.organizationId.toUpperCase();
-  const databaseName = `tenant_${organizationId.toLowerCase().replace(/[^a-z0-9]/g, '_')}_${Date.now().toString(36)}`.slice(0, 63);
-  let orgPk: number | undefined;
+  const databaseName = databaseNameFromOrganizationName(v.organizationName);
+  if (!databaseName) return res.status(400).json({ error: 'Organization name must include at least one English letter or number.' });
 
   try {
     const duplicate = await masterPool.query(
-      `SELECT 1 FROM organizations WHERE UPPER(organization_id)=$1 OR LOWER(email)=LOWER($2)`,
-      [organizationId, v.email]
+      `SELECT 1 FROM organizations
+       WHERE UPPER(organization_id)=$1 OR LOWER(email)=LOWER($2) OR tenant_database_name=$3`,
+      [organizationId, v.email, databaseName]
     );
-    if (duplicate.rowCount) return res.status(409).json({ error: 'Organization ID or registration email is already registered.' });
+    if (duplicate.rowCount) return res.status(409).json({ error: 'Organization ID or email is already registered, or this organization name is already in use.' });
 
     // Provision first; a failed provisioning attempt does not leave a false active organization.
     await createTenantDatabase(databaseName);
@@ -58,7 +60,7 @@ authRouter.post('/signup', async (req, res) => {
          VALUES ($1,$2,$3,$4,$5) RETURNING id`,
         [organizationId, v.organizationName, v.email, v.country, databaseName]
       );
-      orgPk = Number(org.rows[0].id);
+      const orgPk = Number(org.rows[0].id);
       const passwordHash = await bcrypt.hash(v.password, 12);
       const user = await client.query(
         `INSERT INTO users (organization_pk, email, full_name, password_hash, role)
@@ -91,7 +93,22 @@ authRouter.post('/signup', async (req, res) => {
 
 authRouter.post('/signin', async (req, res) => {
   const parsed = signinSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: 'Invalid sign-in details.' });
+  if (!parsed.success) {
+    try {
+      const attemptedOrganizationId = typeof req.body?.organizationId === 'string' ? req.body.organizationId : null;
+      const attemptedEmail = typeof req.body?.email === 'string' ? req.body.email : null;
+      await auditAuthenticationEvent({
+        organizationId: attemptedOrganizationId,
+        email: attemptedEmail,
+        outcome: 'FAILURE',
+        description: 'Sign-in rejected because the submitted details were invalid.'
+      });
+    } catch (error) {
+      console.error('Failed to record invalid sign-in attempt:', error);
+      return res.status(500).json({ error: 'Unable to record sign-in attempt. Please try again.' });
+    }
+    return res.status(400).json({ error: 'Invalid sign-in details.' });
+  }
   const v = parsed.data;
   try {
     const result = await masterPool.query(
@@ -103,15 +120,26 @@ authRouter.post('/signin', async (req, res) => {
     );
     const row = result.rows[0];
     if (!row || !row.is_active || !(await bcrypt.compare(v.password, row.password_hash))) {
+      await auditAuthenticationEvent({
+        organizationPk: row ? Number(row.organization_pk) : null,
+        organizationId: v.organizationId.toUpperCase(),
+        email: v.email,
+        outcome: 'FAILURE',
+        description: !row ? 'Failed sign-in: organization or account was not found.'
+          : !row.is_active ? 'Failed sign-in: account is inactive.'
+            : 'Failed sign-in: password did not match.'
+      });
       return res.status(401).json({ error: 'Invalid organization ID, email, or password.' });
     }
+    await auditAuthenticationEvent({
+      organizationPk: Number(row.organization_pk),
+      organizationId: row.organization_id,
+      actorId: Number(row.id),
+      email: row.email,
+      outcome: 'SUCCESS',
+      description: 'User signed in successfully.'
+    });
     const token = issueToken(row);
-    try {
-      await audit(getTenantPool(row.tenant_database_name), {
-        actorId: Number(row.id), actorEmail: row.email, action: 'SIGN_IN',
-        resourceType: 'authentication', description: 'User signed in successfully.'
-      });
-    } catch (e) { console.error('Sign-in audit failed:', e); }
     return res.json({ token, organizationId: row.organization_id, role: row.role, email: row.email });
   } catch (err) {
     console.error('Signin failed:', err);

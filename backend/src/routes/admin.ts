@@ -19,9 +19,26 @@ adminRouter.get('/subscription', async (req,res) => {
 
 adminRouter.get('/activity-logs', allowRoles('SUPER_ADMIN'), async (req,res) => {
   const limit=Math.min(200,Math.max(1,Number(req.query.limit)||100));
-  const result=await getTenantPool(req.auth!.databaseName).query(
+  const [tenantResult, authResult] = await Promise.all([
+    getTenantPool(req.auth!.databaseName).query(
     `SELECT id,actor_id,actor_email,actor_type,action,resource_type,resource_id,description,outcome,metadata,created_at
      FROM activity_logs ORDER BY created_at DESC LIMIT $1`,[limit]
-  );
-  res.json({logs:result.rows});
+    ),
+    masterPool.query(
+      `SELECT id, actor_id, email AS actor_email,
+              CASE WHEN actor_id IS NULL THEN 'ANONYMOUS' ELSE 'USER' END AS actor_type,
+              'SIGN_IN' AS action, 'authentication' AS resource_type,
+              organization_id AS resource_id, description, outcome,
+              '{}'::jsonb AS metadata, created_at
+       FROM authentication_events
+       WHERE organization_pk=$1 OR (organization_pk IS NULL AND UPPER(organization_id)=UPPER($2))
+       ORDER BY created_at DESC LIMIT $3`,
+      [req.auth!.organizationPk, req.auth!.organizationId, limit]
+    )
+  ]);
+  const logs = [
+    ...tenantResult.rows.map(log => ({ ...log, id: `tenant-${log.id}` })),
+    ...authResult.rows.map(log => ({ ...log, id: `auth-${log.id}` }))
+  ].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()).slice(0, limit);
+  res.json({logs});
 });
